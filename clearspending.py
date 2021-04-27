@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import urllib.parse
 import urllib.request
+import http
 import json
 from pathlib import Path
+import time
 
 
 class ClearspendingSearch(object):
@@ -16,6 +18,10 @@ class ClearspendingSearch(object):
     search_url = 'http://openapi.clearspending.ru/restapi/v3/contracts/search/?'
     # количество контрактов на страницу
     per_page = 50
+    # статистика по обращениеям к URL для скачивания
+    resp_stat = []
+    # максимальное количество засыпаний программы, если получены неполные данные
+    max_sleep_count = 3
 
     def __init__(self, **kwargs):
         """
@@ -26,9 +32,10 @@ class ClearspendingSearch(object):
             file_prefix: префикс для имён файлов, в которые сохранять данные контрактов
         """
 
+        self._downloads_stat = None
         self._search_params = None
         self._search_resp = None
-        self._num_contracts = 0
+        self._filter_search_resp_func = None
         self.downloads_dir = kwargs.get('downloads_dir', None)
         self.file_prefix = kwargs.get('file_prefix', None)
         self._prepare_dir(self.downloads_dir)
@@ -52,12 +59,14 @@ class ClearspendingSearch(object):
                 data = urllib.parse.urlencode(params)
                 url = search_url + str(data)
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req) as response:
-                    print("URL: ", url)
-                    return response.read()
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    return {'url': url, 'response': response.read(), 'status': 'success'}
             except urllib.request.HTTPError as e:
-                break
-        return False
+                return {'url': url, 'response': str(e), 'status': 'http_error'}
+            except http.client.IncompleteRead as e:
+                return {'url': url, 'response': str(e), 'status': 'incomplete_data'}
+            except (ConnectionError, TimeoutError) as e:
+                {'url': url, 'response': str(e), 'status': 'connection_error'}
 
     @staticmethod
     def save(data, filename):
@@ -93,8 +102,7 @@ class ClearspendingSearch(object):
         return '_'.join(filename_chunks) + ".json"
 
     def download_page(self, page):
-        """
-        Скачивание одной страницы данных из API.
+        """Скачивание одной страницы данных из API.
 
         :param page: номер страницы
         """
@@ -104,54 +112,73 @@ class ClearspendingSearch(object):
                             'page': page,
                             'perpage': self.per_page})
         # если нашлись контракты, то записываем их
-        if resp is not False:
-            self._search_resp = json.loads(resp)
+        if resp['status'] == 'success':
+            self._search_resp = json.loads(resp['response'])
+            del resp['response']
             self._prepare_dir(self.downloads_dir)
-            self.save(self.last_search_json, '/'.join([self.downloads_dir, self.generate_filename(page)]))
-            self._num_contracts += self.total
-            return True
+            filename = '/'.join([self.downloads_dir, self.generate_filename(page)])
+            if len(self.last_search_resp) > 0:
+                self.save(self.last_search_resp, filename)
+                resp['message'] = ''
+                return {**resp, 'filename': filename}
+            resp['message'] = 'empty'
+            return {**resp, 'filename': None}
         self._search_resp = None
-        return False
+        resp['message'] = resp['response']
+        del resp['response']
+        return {**resp, 'filename': None}
 
     def download_all(self):
-        """
-        Поиск и постраничное скачивание контрактов в каталог,
-        указанный при инициализации.
-        """
+        """Поиск и постраничное скачивание всех контрактов."""
 
+        self._downloads_stat = list()
         page = 1
+        sleep_count = 0
         while True:
             download_res = self.download_page(page)
-            # Если на текущей странице данных нет, то завершаем цикл скачивания.
-            if download_res is False:
+            self._downloads_stat.append(download_res)
+            # Если на текущей странице данных нет,
+            # то завершаем цикл скачивания.
+            if download_res['status'] == 'http_error':
                 break
-            page += 1
+            if download_res['status'] in ['incomplete_data', 'connection_error']:
+                if sleep_count < self.max_sleep_count:
+                    print('sleep...', sleep_count)
+                    time.sleep(10)
+                    sleep_count += 1
+                else:
+                    break
+            if download_res['status'] == 'success':
+                sleep_count = 0
+                page += 1
 
     @property
-    def last_search_json(self):
+    def filter_search_resp_func(self):
+        return self._filter_search_resp_func
+
+    @filter_search_resp_func.setter
+    def filter_search_resp_func(self, func):
+        self._filter_search_resp_func = func
+
+    @property
+    def last_search_resp(self):
+        if self.filter_search_resp_func is not None:
+            try:
+                return self.filter_search_resp_func(self._search_resp)
+            except Exception as e:
+                raise Exception('Невозможно отфильтровать данные.', str(e))
         return self._search_resp
 
     @property
-    def total(self):
-        try:
-            return self.last_search_json['contracts']['total']
-        except:
-            return None
+    def downloads_stat(self):
+        return self._downloads_stat
 
     @property
     def page(self):
         try:
-            return self.last_search_json['contracts']['page']
+            return self.last_search_resp['contracts']['page']
         except:
             return None
-
-    @property
-    def num_contracts(self):
-        return self._num_contracts
-
-    @property
-    def last_search_params(self):
-        return self._search_params
 
     @property
     def search_params(self):
